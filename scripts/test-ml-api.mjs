@@ -8,62 +8,55 @@ const fmt = v => `R$ ${Number(v).toLocaleString('pt-BR', { minimumFractionDigits
 async function run() {
   console.log('================================================')
   console.log(' ML API Test — Wolverine PS5')
-  console.log(` EAN: ${EAN} | SRP: ${fmt(SRP)} | Piso: ${fmt(PRICE_FLOOR)}`)
+  console.log(` EAN: ${EAN} | Piso: ${fmt(PRICE_FLOOR)}`)
   console.log('================================================\n')
 
-  console.log('Buscando listings...')
-  const res  = await fetch(`${ML_API}/sites/MLB/search?q=${EAN}&limit=50`)
-  const data = await res.json()
-  const total   = data.paging?.total ?? 0
-  const results = data.results ?? []
+  // Tentativa 1 — busca direta por EAN
+  console.log('[1] Busca direta por EAN...')
+  const r1 = await fetch(`${ML_API}/sites/MLB/search?q=${EAN}&limit=20`)
+  const d1 = await r1.json()
+  console.log(`    Total: ${d1.paging?.total ?? 0}\n`)
 
-  console.log(`Total encontrado: ${total} | Exibindo: ${results.length}\n`)
+  // Tentativa 2 — busca por EAN no campo correto
+  console.log('[2] Busca por GTIN/EAN...')
+  const r2 = await fetch(`${ML_API}/sites/MLB/search?q=${EAN}&category=MLB1648&limit=20`)
+  const d2 = await r2.json()
+  console.log(`    Total: ${d2.paging?.total ?? 0}\n`)
 
-  if (!results.length) {
-    console.log('Nenhum listing ainda. Tentando por título...')
-    const r2   = await fetch(`${ML_API}/sites/MLB/search?q=Wolverine+PS5&limit=5`)
-    const d2   = await r2.json()
-    console.log(`Por título: ${d2.paging?.total ?? 0} resultados`)
-    d2.results?.slice(0, 5).forEach((r, i) => {
-      console.log(`  ${i+1}. ${r.title}`)
-      console.log(`     Preço: ${fmt(r.price)} | Seller: ${r.seller?.id} | ID: ${r.id}`)
-    })
-    return
-  }
+  // Tentativa 3 — busca pelo catalog_product_id
+  console.log('[3] Busca no catálogo MLB por EAN...')
+  const r3 = await fetch(`${ML_API}/products/search?site_id=MLB&q=${EAN}`)
+  const d3 = await r3.json()
+  console.log(`    Resposta: ${JSON.stringify(d3).slice(0, 200)}\n`)
+
+  // Tentativa 4 — busca por título + plataforma (fallback confiável)
+  console.log('[4] Busca por título (fallback)...')
+  const r4 = await fetch(`${ML_API}/sites/MLB/search?q=Marvel+Wolverine+PlayStation+5&limit=20`)
+  const d4 = await r4.json()
+  const results = d4.results ?? []
+  console.log(`    Total: ${d4.paging?.total ?? 0} | Exibindo: ${results.length}\n`)
 
   const violations = []
-  const warnings   = []
 
-  for (const [i, item] of results.entries()) {
-    const price   = item.price
-    const orig    = item.original_price
-    const isBelow = price < PRICE_FLOOR
-    const hasDisc = orig && (orig - price) / orig > 0.02
+  results.forEach((r, i) => {
+    const isBelow = r.price < PRICE_FLOOR
+    const hasDisc = r.original_price && (r.original_price - r.price) / r.original_price > 0.02
+    const status  = isBelow ? '🔴 VIOLACAO' : hasDisc ? '🟡 DESCONTO' : '🟢 OK'
 
-    const status = isBelow ? '🔴 VIOLACAO' : hasDisc ? '🟡 DESCONTO' : '🟢 OK'
+    console.log(`  [${i+1}] ${status}`)
+    console.log(`       ${r.title?.slice(0, 55)}`)
+    console.log(`       Preço:  ${fmt(r.price)}${r.original_price ? ` (de ${fmt(r.original_price)})` : ''}`)
+    console.log(`       Seller: ${r.seller?.id}`)
+    console.log(`       Qtd:    ${r.available_quantity ?? '?'}`)
+    console.log(`       Tags:   ${(r.tags ?? []).join(', ') || 'nenhuma'}`)
+    console.log(`       URL:    ${r.permalink}\n`)
 
-    console.log(`[${i+1}] ${status}`)
-    console.log(`     Título:  ${item.title?.slice(0, 55)}`)
-    console.log(`     Preço:   ${fmt(price)}${orig ? ` (de ${fmt(orig)})` : ''}`)
-    console.log(`     Seller:  ${item.seller?.id}`)
-    console.log(`     Qtd:     ${item.available_quantity ?? '?'}`)
-    console.log(`     Pré-venda: ${(item.tags ?? []).includes('pre_release') ? 'SIM' : 'não'}`)
-    console.log(`     URL:     ${item.permalink}\n`)
-
-    if (isBelow)  violations.push({ price, seller: item.seller?.id, url: item.permalink })
-    if (hasDisc)  warnings.push({ price, orig, seller: item.seller?.id })
-  }
+    if (isBelow) violations.push(r)
+  })
 
   console.log('================================================')
-  console.log(` Listings:   ${results.length}`)
-  console.log(` Violações:  ${violations.length} ${violations.length ? '🔴' : '✓'}`)
-  console.log(` Descontos:  ${warnings.length}   ${warnings.length   ? '🟡' : '✓'}`)
+  console.log(` Violations: ${violations.length} ${violations.length ? '🔴' : '✓'}`)
   console.log('================================================')
-
-  if (violations.length) {
-    console.log('\nViolações:')
-    violations.forEach(v => console.log(`  → Seller ${v.seller}: ${fmt(v.price)} | ${v.url}`))
-  }
 }
 
 run().catch(e => { console.error('Erro:', e); process.exit(1) })
