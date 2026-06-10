@@ -1,0 +1,221 @@
+/**
+ * market-scanner.mjs
+ * 
+ * Scanner universal — detecta qualquer listing do Wolverine PS5
+ * em todos os canais monitorados, mesmo sem EAN indexado.
+ * 
+ * Estratégia multicamada:
+ *   1. EAN direto (quando indexado)
+ *   2. IDs de catálogo conhecidos (ML)
+ *   3. Palavras-chave + filtro de preço + filtro de categoria
+ *   4. Deduplicação por URL para não alertar duas vezes o mesmo listing
+ * 
+ * EAN      : 711719028116
+ * SRP      : R$ 399,90
+ * Piso     : R$ 371,91
+ * Range    : R$ 290 – R$ 400 (para filtrar falsos positivos)
+ */
+
+const EAN         = '711719028116'
+const PRICE_MIN   = 290
+const PRICE_MAX   = 400
+const PRICE_FLOOR = 371.91
+const ML_API      = 'https://api.mercadolibre.com'
+
+// IDs de catálogo ML conhecidos — adicionar mais conforme forem descobertos
+const ML_CATALOG_IDS = ['MLB70334827', 'MLB66764100']
+
+// Combinações de palavras-chave — todas serão buscadas
+const KEYWORDS = [
+  'Wolverine PS5',
+  'Wolverine PlayStation 5',
+  'Marvel Wolverine PS5',
+  'Marvel Wolverine PlayStation 5',
+  'Wolverine PS5 Standard',
+  'Wolverine da Marvel PlayStation',
+  `${EAN}`,
+]
+
+// Categorias válidas para filtrar falsos positivos
+// (action figures, HQs, roupas com nome Wolverine são excluídos)
+const VALID_CATEGORY_HINTS = [
+  'jogo', 'game', 'ps5', 'playstation', 'mídia física', 'fisico',
+  'standard edition', 'blu-ray', 'videogame'
+]
+
+const fmt = v => `R$ ${Number(v).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`
+
+// ── Filtro de relevância ──────────────────────────────────────
+// Retorna true se o listing é provavelmente o jogo correto
+
+function isRelevant(item) {
+  const title = (item.title ?? '').toLowerCase()
+  const price = item.price ?? 0
+
+  // Filtro de preço — elimina action figures (R$50) e consoles (R$4000)
+  if (price < PRICE_MIN || price > PRICE_MAX) return false
+
+  // Precisa ter pelo menos uma palavra de categoria válida no título
+  const hasCategory = VALID_CATEGORY_HINTS.some(hint => title.includes(hint))
+  
+  // Ou ser um resultado de busca por EAN/catálogo (já é relevante por definição)
+  const isFromEAN     = item._source === 'ean'
+  const isFromCatalog = item._source === 'catalog'
+
+  return isFromEAN || isFromCatalog || hasCategory
+}
+
+// ── Mercado Livre ─────────────────────────────────────────────
+
+async function scanMercadoLivre() {
+  const results = []
+
+  // 1. Por EAN
+  try {
+    const r = await fetch(`${ML_API}/sites/MLB/search?q=${EAN}&limit=50`)
+    const d = await r.json()
+    ;(d.results ?? []).forEach(item => {
+      results.push({ ...item, _source: 'ean', _channel: 'mercadolivre' })
+    })
+  } catch(e) { console.log('[ML] EAN error:', e.message) }
+
+  // 2. Por IDs de catálogo
+  for (const catId of ML_CATALOG_IDS) {
+    try {
+      const r = await fetch(`${ML_API}/sites/MLB/search?q=${catId}&limit=50`)
+      const d = await r.json()
+      ;(d.results ?? []).forEach(item => {
+        results.push({ ...item, _source: 'catalog', _channel: 'mercadolivre' })
+      })
+    } catch(e) { console.log(`[ML] Catalog ${catId} error:`, e.message) }
+    await new Promise(r => setTimeout(r, 300))
+  }
+
+  // 3. Por palavras-chave
+  for (const kw of KEYWORDS) {
+    try {
+      const r = await fetch(`${ML_API}/sites/MLB/search?q=${encodeURIComponent(kw)}&category=MLB1648&limit=20`)
+      const d = await r.json()
+      ;(d.results ?? []).forEach(item => {
+        results.push({ ...item, _source: 'keyword', _channel: 'mercadolivre' })
+      })
+    } catch(e) { console.log(`[ML] Keyword "${kw}" error:`, e.message) }
+    await new Promise(r => setTimeout(r, 300))
+  }
+
+  return results
+}
+
+// ── Normaliza resultado para formato padrão ───────────────────
+
+function normalize(item, channel) {
+  return {
+    channel,
+    id:          item.id ?? item._id,
+    title:       item.title ?? '',
+    price:       item.price ?? 0,
+    seller_id:   String(item.seller?.id ?? item.seller_id ?? ''),
+    seller_name: item.seller?.nickname ?? item.seller_name ?? '',
+    url:         item.permalink ?? item.url ?? '',
+    available:   (item.available_quantity ?? 1) > 0,
+    is_presale:  (item.tags ?? []).includes('pre_release') || item.buying_mode === 'classified',
+    source:      item._source ?? 'keyword',
+    below_floor: (item.price ?? 0) < PRICE_FLOOR,
+    raw:         item,
+  }
+}
+
+// ── Deduplicação por URL ──────────────────────────────────────
+
+function deduplicate(items) {
+  const seen = new Set()
+  return items.filter(item => {
+    const key = item.url || `${item.channel}-${item.id}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+// ── Runner principal ──────────────────────────────────────────
+
+async function run() {
+  console.log('╔══════════════════════════════════════════════╗')
+  console.log('║   WOLVERINE PS5 — MARKET SCANNER             ║')
+  console.log(`║   EAN: ${EAN}                  ║`)
+  console.log(`║   Range: ${fmt(PRICE_MIN)} – ${fmt(PRICE_MAX)} | Piso: ${fmt(PRICE_FLOOR)} ║`)
+  console.log('╚══════════════════════════════════════════════╝\n')
+
+  const raw = []
+
+  // Mercado Livre
+  console.log('🔍 Varrendo Mercado Livre...')
+  const mlResults = await scanMercadoLivre()
+  raw.push(...mlResults.map(r => normalize(r, 'mercadolivre')))
+  console.log(`   → ${mlResults.length} brutos coletados\n`)
+
+  // Filtra relevantes e deduplica
+  const relevant = deduplicate(raw.filter(isRelevant))
+
+  console.log(`📦 Listings relevantes encontrados: ${relevant.length}\n`)
+
+  if (relevant.length === 0) {
+    console.log('ℹ️  Nenhum listing encontrado ainda.')
+    console.log('   O jogo pode não ter pré-venda aberta nos canais monitorados.')
+    console.log(`\n   Total bruto varrido: ${raw.length} itens`)
+    console.log(`   Filtrados por preço/categoria: ${raw.length - relevant.length}`)
+    console.log('\n✓ Scanner concluído — sem alertas.')
+    return { found: 0, violations: 0, new_sellers: 0 }
+  }
+
+  // Classifica e imprime
+  const violations  = []
+  const presales    = []
+  const normal      = []
+
+  relevant.forEach((item, i) => {
+    const flags = []
+    if (item.below_floor) flags.push('🔴 ABAIXO DO PISO')
+    if (item.is_presale)  flags.push('⚠️  PRÉ-VENDA')
+    const status = flags.length ? flags.join(' | ') : '🟢 OK'
+
+    console.log(`[${i+1}] ${status}`)
+    console.log(`     Canal:  ${item.channel.toUpperCase()}`)
+    console.log(`     Título: ${item.title.slice(0, 60)}`)
+    console.log(`     Preço:  ${fmt(item.price)}`)
+    console.log(`     Seller: ${item.seller_name || item.seller_id}`)
+    console.log(`     Qtd:    ${item.available ? 'Disponível' : 'Indisponível'}`)
+    console.log(`     Fonte:  ${item.source}`)
+    console.log(`     URL:    ${item.url}\n`)
+
+    if (item.below_floor) violations.push(item)
+    if (item.is_presale)  presales.push(item)
+    else                  normal.push(item)
+  })
+
+  // Resumo
+  console.log('╔══════════════════════════════════════════════╗')
+  console.log('║   RESUMO DO SCAN                             ║')
+  console.log('╚══════════════════════════════════════════════╝')
+  console.log(` Total listings : ${relevant.length}`)
+  console.log(` Violações      : ${violations.length} ${violations.length ? '🔴' : '✓'}`)
+  console.log(` Pré-vendas     : ${presales.length}`)
+  console.log(` Normais        : ${normal.length}`)
+  console.log(` Canais únicos  : ${[...new Set(relevant.map(r => r.channel))].join(', ')}`)
+
+  if (violations.length) {
+    console.log('\n⚠️  VIOLAÇÕES DE PREÇO:')
+    violations.forEach(v => {
+      console.log(`   → ${v.channel} | ${v.seller_name} | ${fmt(v.price)} | ${v.url}`)
+    })
+  }
+
+  return {
+    found:      relevant.length,
+    violations: violations.length,
+    presales:   presales.length,
+    items:      relevant,
+  }
+}
+
+run().catch(e => { console.error('ERRO FATAL:', e); process.exit(1) })
