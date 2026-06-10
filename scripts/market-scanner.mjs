@@ -1,79 +1,65 @@
-const EAN         = '711719028116'
-const PRICE_MIN   = 290
-const PRICE_MAX   = 400
+const EAN = '711719028116'
+const PRICE_MIN = 290
+const PRICE_MAX = 400
 const PRICE_FLOOR = 371.91
-const ML_API      = 'https://api.mercadolibre.com'
+const ML_API = 'https://api.mercadolibre.com'
 const ML_CATALOG_IDS = ['MLB70334827', 'MLB66764100']
-const KEYWORDS = [
-  'Wolverine PS5',
-  'Wolverine PlayStation 5',
-  'Marvel Wolverine PS5',
-  'Marvel Wolverine PlayStation 5',
-  'Wolverine da Marvel PlayStation',
-  '711719028116',
-]
-const VALID_CATEGORY_HINTS = [
-  'jogo', 'game', 'ps5', 'playstation', 'midia fisica', 'fisico',
-  'standard edition', 'blu-ray', 'videogame'
-]
-const fmt = v => `R$ ${Number(v).toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`
+const KEYWORDS = ['Wolverine PS5','Wolverine PlayStation 5','Marvel Wolverine PS5','Wolverine da Marvel PlayStation','711719028116']
+const HINTS = ['jogo','game','ps5','playstation','fisico','standard','blu-ray','videogame']
+const fmt = v => `R$ ${Number(v).toLocaleString('pt-BR',{minimumFractionDigits:2})}`
 
 function isRelevant(item) {
   const title = (item.title ?? '').toLowerCase()
   const price = item.price ?? 0
   if (price < PRICE_MIN || price > PRICE_MAX) return false
-  const hasCategory = VALID_CATEGORY_HINTS.some(hint => title.includes(hint))
-  return item._source === 'ean' || item._source === 'catalog' || item._source === 'catalog_items' || hasCategory
+  if (['ean','catalog','catalog_items'].includes(item._source)) return true
+  return HINTS.some(h => title.includes(h))
 }
 
-async function scanMercadoLivre() {
-  const results = []
-
-  // 1. EAN direto
+async function get(url) {
   try {
-    const r = await fetch(`${ML_API}/sites/MLB/search?q=${EAN}&limit=50`)
-    const d = await r.json()
-    console.log(`  [EAN] Total: ${d.paging?.total ?? 0}`)
-    ;(d.results ?? []).forEach(item => results.push({ ...item, _source: 'ean' }))
-  } catch(e) { console.log('[EAN] error:', e.message) }
+    const r = await fetch(url)
+    return await r.json()
+  } catch(e) {
+    console.log('  fetch error:', e.message)
+    return {}
+  }
+}
 
-  // 2. Itens vinculados ao catálogo (endpoint correto)
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
+
+async function scan() {
+  const all = []
+
+  console.log('[1] EAN direto...')
+  const d1 = await get(`${ML_API}/sites/MLB/search?q=${EAN}&limit=50`)
+  console.log('    total:', d1.paging?.total ?? 0)
+  ;(d1.results ?? []).forEach(i => all.push({...i, _source:'ean'}))
+
   for (const catId of ML_CATALOG_IDS) {
-    try {
-      const r = await fetch(`${ML_API}/products/${catId}/items`)
-      const d = await r.json()
-      console.log(`  [Catálogo ${catId}] Resposta:`, JSON.stringify(d).slice(0, 150))
-      const items = d.results ?? d.items ?? []
-      items.forEach(item => results.push({ ...item, _source: 'catalog_items' }))
-    } catch(e) { console.log(`[Catálogo ${catId}] error:`, e.message) }
-    await new Promise(r => setTimeout(r, 300))
+    console.log(`[2] Catalogo ${catId} items...`)
+    const d2 = await get(`${ML_API}/products/${catId}/items`)
+    console.log('    resposta:', JSON.stringify(d2).slice(0,120))
+    const items = d2.results ?? d2.items ?? []
+    items.forEach(i => all.push({...i, _source:'catalog_items'}))
+    await sleep(300)
+
+    console.log(`[3] Search ${catId}...`)
+    const d3 = await get(`${ML_API}/sites/MLB/search?q=${catId}&limit=50`)
+    console.log('    total:', d3.paging?.total ?? 0)
+    ;(d3.results ?? []).forEach(i => all.push({...i, _source:'catalog'}))
+    await sleep(300)
   }
 
-  // 3. Search pelo ID do catálogo
-  for (const catId of ML_CATALOG_IDS) {
-    try {
-      const r = await fetch(`${ML_API}/sites/MLB/search?q=${catId}&limit=50`)
-      const d = await r.json()
-      console.log(`  [Search ${catId}] Total: ${d.paging?.total ?? 0}`)
-      ;(d.results ?? []).forEach(item => results.push({ ...item, _source: 'catalog' }))
-    } catch(e) { console.log(`[Search ${catId}] error:`, e.message) }
-    await new Promise(r => setTimeout(r, 300))
-  }
-
-  // 4. Por palavras-chave
   for (const kw of KEYWORDS) {
-    try {
-      const r = await fetch(`${ML_API}/sites/MLB/search?q=${encodeURIComponent(kw)}&category=MLB1648&limit=20`)
-      const d = await r.json()
-      if ((d.paging?.total ?? 0) > 0) {
-        console.log(`  [KW "${kw}"] Total: ${d.paging.total}`)
-      }
-      ;(d.results ?? []).forEach(item => results.push({ ...item, _source: 'keyword' }))
-    } catch(e) { console.log(`[KW] error:`, e.message) }
-    await new Promise(r => setTimeout(r, 300))
+    const d4 = await get(`${ML_API}/sites/MLB/search?q=${encodeURIComponent(kw)}&category=MLB1648&limit=20`)
+    const total = d4.paging?.total ?? 0
+    if (total > 0) console.log(`[KW] "${kw}" total: ${total}`)
+    ;(d4.results ?? []).forEach(i => all.push({...i, _source:'keyword'}))
+    await sleep(300)
   }
 
-  return results
+  return all
 }
 
 function normalize(item) {
@@ -86,27 +72,46 @@ function normalize(item) {
     url:         item.permalink ?? item.url ?? '',
     available:   (item.available_quantity ?? 1) > 0,
     is_presale:  (item.tags ?? []).includes('pre_release'),
-    source:      item._source ?? 'keyword',
+    source:      item._source ?? '',
     below_floor: (item.price ?? 0) < PRICE_FLOOR,
   }
 }
 
-function deduplicate(items) {
+function dedup(items) {
   const seen = new Set()
-  return items.filter(item => {
-    const key = item.url || item.id
-    if (seen.has(key)) return false
-    seen.add(key); return true
+  return items.filter(i => {
+    const k = i.url || i.id
+    if (seen.has(k)) return false
+    seen.add(k)
+    return true
   })
 }
 
 async function run() {
-  console.log('=== WOLVERINE PS5 — MARKET SCANNER ===')
+  console.log('=== WOLVERINE PS5 MARKET SCANNER ===')
   console.log(`EAN: ${EAN} | Range: ${fmt(PRICE_MIN)}-${fmt(PRICE_MAX)} | Piso: ${fmt(PRICE_FLOOR)}\n`)
 
-  console.log('Varrendo Mercado Livre...')
-  const raw = await scanMercadoLivre()
-  console.log(`\nBrutos coletados: ${raw.length}`)
+  const raw = await scan()
+  console.log(`\nBrutos: ${raw.length}`)
 
-  const relevant = deduplicate(raw.filter(isRelevant).map(normalize))
-  console.log(`Listings relevantes: ${relevant.length}\n`)
+  const relevant = dedup(raw.filter(isRelevant).map(normalize))
+  console.log(`Relevantes: ${relevant.length}\n`)
+
+  if (!relevant.length) {
+    console.log('Nenhum seller ativo encontrado.')
+    console.log('Produto existe no catalogo ML mas sem pré-venda aberta por sellers.')
+    return
+  }
+
+  relevant.forEach((item, i) => {
+    const s = item.below_floor ? 'VIOLACAO' : item.is_presale ? 'PRE-VENDA' : 'OK'
+    console.log(`[${i+1}] ${s} | ${fmt(item.price)} | ${item.seller_name || item.seller_id}`)
+    console.log(`     ${item.title.slice(0,60)}`)
+    console.log(`     fonte: ${item.source}`)
+    console.log(`     ${item.url}\n`)
+  })
+
+  console.log(`=== FIM | ${relevant.length} listings ===`)
+}
+
+run().catch(e => { console.error('ERRO:', e); process.exit(1) })
